@@ -1,0 +1,11 @@
+node_modules/
+dist/
+.env
+logs/*.json
+.DS_Store
+# Ignore baselines and generated grouped config (we keep an example file in repo)
+baselines.json
+config/channels.json
+
+# Local env variants
+.env.local

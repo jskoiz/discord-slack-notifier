@@ -1,0 +1,1 @@
+# Keep the logs directory in the repository. Actual JSON logs are ignored by .gitignore.

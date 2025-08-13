@@ -1,0 +1,17 @@
+[
+  {
+    "guild": "854930419753549824",
+    "guildName": "ExampleGuild",
+    "channels": [
+      {
+        "channel": "1383246011572424744",
+        "channelName": "notis",
+        "baseline": {
+          "lastMessageId": "1400000000000000000",
+          "timestamp": "2025-01-01T00:00:00.000Z",
+          "content": "Example baseline content"
+        }
+      }
+    ]
+  }
+]
