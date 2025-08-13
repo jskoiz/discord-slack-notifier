@@ -4,6 +4,7 @@ declare const process: any;
 
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
 
 export const CONFIG_PATH = path.resolve(process.cwd(), 'config', 'channels.json');
 export const LOGS_DIR = path.resolve(process.cwd(), 'logs');
@@ -63,11 +64,11 @@ export function loadChannels(): ChannelConfig[] {
       throw new Error('Invalid channel entry shape in config file');
     }
 
-    console.debug(`Loaded ${flattened.length} channel(s) from config`);
+    logger.debug(`Loaded ${flattened.length} channel(s) from config`);
     return flattened;
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`ERROR: Failed to load channels from ${CONFIG_PATH} - ${msg}`);
+    logger.error(`Failed to load channels from ${CONFIG_PATH} - ${msg}`);
     process.exit(1);
     return [];
   }

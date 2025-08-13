@@ -69,25 +69,74 @@ declare const process: any;
 
 const dotenv = require('dotenv');
 const axios = require('axios');
+const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
+
+// axios instance with keepAlive to reuse sockets and reduce "socket hang up" issues
+const axiosInstance = axios.create({
+  timeout: 15_000,
+  httpAgent: new http.Agent({ keepAlive: true, maxSockets: 50 }),
+  httpsAgent: new https.Agent({ keepAlive: true, maxSockets: 50 }),
+});
+
+// Lightweight retry wrapper for transient network errors (ECONNRESET, ETIMEDOUT, EPIPE, "socket hang up", etc.)
+async function requestWithRetries(method: string, url: string, opts: any = {}, maxAttempts = 3): Promise<any> {
+  let attempt = 0;
+  let backoff = 500;
+  while (attempt < maxAttempts) {
+    attempt += 1;
+    try {
+      const config = Object.assign({}, opts, { method, url });
+      return await axiosInstance.request(config);
+    } catch (err: unknown) {
+      const anyErr = err as any;
+      const message = anyErr?.message ?? String(anyErr);
+      const code = anyErr?.code ?? undefined;
+      const shouldRetry =
+        (typeof message === 'string' &&
+          (message.includes('ECONNRESET') ||
+            message.includes('ETIMEDOUT') ||
+            message.includes('EPIPE') ||
+            message.includes('socket hang up'))) ||
+        code === 'ECONNRESET' ||
+        code === 'ETIMEDOUT' ||
+        code === 'EPIPE' ||
+        code === 'ECONNABORTED';
+      if (!shouldRetry || attempt >= maxAttempts) {
+        throw err;
+      }
+      // jittered backoff
+      await new Promise((r) => setTimeout(r, backoff + Math.floor(Math.random() * 200)));
+      backoff *= 2;
+    }
+  }
+  // In the unlikely case we exit loop without returning, throw to surface caller errors
+  throw new Error('requestWithRetries: exceeded attempts without response');
+}
 
 dotenv.config();
 
 const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? '3000');
+// When running under ts-node-dev (file watcher) we should avoid writing back to
+// the watched config file during startup — otherwise the watcher will restart
+// the process repeatedly. Detect common env vars used by dev runners.
+const IS_DEV_WATCH = Boolean(process.env.TS_NODE_DEV || process.env.NODE_ENV === 'development');
 
 function logInfo(message: string): void {
-  console.log(`INFO: [${new Date().toISOString()}] ${message}`);
+  logger.info(message);
 }
 
 function logDebug(message: string): void {
-  console.log(`DEBUG: [${new Date().toISOString()}] ${message}`);
+  logger.debug(message);
 }
 
 function logError(message: string): void {
-  console.error(`ERROR: [${new Date().toISOString()}] ${message}`);
+  logger.error(message);
 }
 
 async function sleep(ms: number): Promise<void> {
@@ -205,24 +254,19 @@ async function sendToSlack(payloadOrText: string | { blocks: any[] }, maxAttempt
   while (attempt < maxAttempts) {
     attempt += 1;
     try {
-      await axios.post(SLACK_WEBHOOK_URL, payload, {
-        headers: { 'Content-Type': 'application/json' },
-        timeout: 10_000,
-      });
+      // Use the retry-capable request helper (this will apply keepAlive agent)
+      await requestWithRetries('post', SLACK_WEBHOOK_URL, { data: payload, headers: { 'Content-Type': 'application/json' } }, maxAttempts);
       logDebug('Sent notification to Slack');
       return;
-    } catch (err: unknown) {
-      const anyErr = err as any;
-      const status = anyErr?.response?.status;
+    } catch (err: any) {
+      const status = err?.response?.status;
       if (status === 429) {
-        // Respect rate limit: honor Retry-After header if present (seconds)
-        const retryAfter = Number(anyErr.response?.headers?.['retry-after']) || Math.ceil(backoff / 1000);
+        const retryAfter = Number(err.response?.headers?.['retry-after']) || Math.ceil(backoff / 1000);
         logDebug(`Slack rate-limited (429). Retry after ${retryAfter}s`);
         await sleep(retryAfter * 1000);
       } else {
         const msg = err instanceof Error ? err.message : String(err);
         logDebug(`Failed sending Slack notification (attempt ${attempt}) - ${msg}`);
-        // exponential backoff before retrying
         await sleep(backoff);
         backoff *= 2;
       }
@@ -354,16 +398,27 @@ const channels = loadChannels(CONFIG_PATH);
 async function enrichAndPersistChannelNames(): Promise<void> {
   const updated: ChannelConfig[] = [];
 
+  // Diagnostic: announce start of enrichment at info level so startup activity is visible.
+  try {
+    logInfo(`Starting channel name enrichment for ${channels.length} channel(s)`);
+  } catch {
+    // ignore logging failures
+  }
+
   // Enrich flattened channels with names where possible.
   for (const ch of channels) {
     const updatedCh: ChannelConfig = { ...ch };
+    try {
+      logInfo(`Enriching names for ${ch.guildId}/${ch.channelId}`);
+    } catch {
+      // ignore
+    }
 
     // fetch channel name
     try {
-      const chResp = await axios.get(`https://discord.com/api/v10/channels/${ch.channelId}`, {
+      const chResp = await requestWithRetries('get', `https://discord.com/api/v10/channels/${ch.channelId}`, {
         headers: { Authorization: DISCORD_TOKEN },
-        timeout: 10_000,
-      });
+      }, 3);
       if (chResp && (chResp as any).data && typeof (chResp as any).data.name === 'string') {
         updatedCh.channelName = (chResp as any).data.name;
       }
@@ -374,16 +429,23 @@ async function enrichAndPersistChannelNames(): Promise<void> {
 
     // fetch guild name
     try {
-      const gResp = await axios.get(`https://discord.com/api/v10/guilds/${ch.guildId}`, {
+      const gResp = await requestWithRetries('get', `https://discord.com/api/v10/guilds/${ch.guildId}`, {
         headers: { Authorization: DISCORD_TOKEN },
-        timeout: 10_000,
-      });
+      }, 3);
       if (gResp && (gResp as any).data && typeof (gResp as any).data.name === 'string') {
         updatedCh.guildName = (gResp as any).data.name;
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
       logDebug(`Failed to fetch guild name for ${ch.guildId} - ${msg}`);
+    }
+
+    try {
+      logInfo(
+        `Enriched ${ch.guildId}/${ch.channelId} -> guildName=${updatedCh.guildName ?? 'n/a'} channelName=${updatedCh.channelName ?? 'n/a'}`
+      );
+    } catch {
+      // ignore
     }
 
     updated.push(updatedCh);
@@ -432,8 +494,18 @@ const groupedMap: Record<string, RawGuildEntry> = {};
   const grouped: RawGuildEntry[] = Object.keys(groupedMap).map((k) => groupedMap[k]);
 
   try {
-    fs.writeFileSync(CONFIG_PATH, JSON.stringify(grouped, null, 2), { encoding: 'utf8' });
-    logDebug(`Wrote enriched (grouped) channels config with names to ${CONFIG_PATH}`);
+    if (IS_DEV_WATCH) {
+      // Avoid modifying watched config files during development hot-reload.
+      logDebug(`Skipping writing enriched grouped channels config to disk (dev watch mode)`);
+    } else {
+      fs.writeFileSync(CONFIG_PATH, JSON.stringify(grouped, null, 2), { encoding: 'utf8' });
+      logDebug(`Wrote enriched (grouped) channels config with names to ${CONFIG_PATH}`);
+    }
+    try {
+      logInfo(`Finished enrichment and wrote ${Object.keys(groupedMap).length} guild(s) to ${CONFIG_PATH}`);
+    } catch {
+      // ignore
+    }
     // ensure in-memory flattened channels reflect the enriched names
     channels.splice(0, channels.length, ...updated);
     // keep RAW_CONFIG in sync with the new grouped form (useful if other code reads it)
@@ -458,20 +530,15 @@ try {
 async function fetchLatestMessageId(channelId: string): Promise<string | undefined> {
   const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
   try {
-    const resp = await axios.get(url, {
-      headers: { Authorization: DISCORD_TOKEN },
-      params: { limit: 1 },
-      timeout: 10_000,
-    });
+    const resp = await requestWithRetries('get', url, { headers: { Authorization: DISCORD_TOKEN }, params: { limit: 1 } }, 3);
     const data = (resp && (resp as any).data) as any[];
     if (Array.isArray(data) && data.length > 0) {
       return String(data[0].id);
     }
     return undefined;
-  } catch (err: unknown) {
-    const anyErr = err as any;
-    if (anyErr && anyErr.response) {
-      logError(`Failed to fetch latest message for channel ${channelId} - ${anyErr.response.status} ${anyErr.response.statusText}`);
+  } catch (err: any) {
+    if (err && err.response) {
+      logError(`Failed to fetch latest message for channel ${channelId} - ${err.response.status} ${err.response.statusText}`);
     } else {
       const msg = err instanceof Error ? err.message : String(err);
       logError(`Failed to fetch latest message for channel ${channelId} - ${msg}`);
@@ -534,6 +601,10 @@ function getBaseline(guildId: string, channelId: string): any | undefined {
 
 function persistConfig(): void {
   try {
+    if (IS_DEV_WATCH) {
+      logDebug('Skipping persistConfig write to config/channels.json in dev watch mode');
+      return;
+    }
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(RAW_CONFIG, null, 2), { encoding: 'utf8' });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
@@ -568,15 +639,13 @@ function setBaseline(guildId: string, channelId: string, entry: { lastMessageId:
 
 async function fetchMessageById(channelId: string, messageId: string): Promise<any | undefined> {
   try {
-    const resp = await axios.get(`https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
+    const resp = await requestWithRetries('get', `https://discord.com/api/v10/channels/${channelId}/messages/${messageId}`, {
       headers: { Authorization: DISCORD_TOKEN },
-      timeout: 10_000,
-    });
+    }, 3);
     return (resp && (resp as any).data) as any;
-  } catch (err: unknown) {
-    const anyErr = err as any;
-    if (anyErr && anyErr.response) {
-      logDebug(`Failed to fetch message ${messageId} for ${channelId} - ${anyErr.response.status}`);
+  } catch (err: any) {
+    if (err && err.response) {
+      logDebug(`Failed to fetch message ${messageId} for ${channelId} - ${err.response.status}`);
     } else {
       const msg = err instanceof Error ? err.message : String(err);
       logDebug(`Failed to fetch message ${messageId} for ${channelId} - ${msg}`);
@@ -656,11 +725,7 @@ async function pollChannel(cfg: ChannelConfig): Promise<void> {
     const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
     const params: Record<string, string | number> = lastMessageId ? { after: lastMessageId, limit: 100 } : { limit: 1 };
     try {
-      const resp = await axios.get(url, {
-        headers: { Authorization: DISCORD_TOKEN },
-        params,
-        timeout: 15_000,
-      });
+      const resp = await requestWithRetries('get', url, { headers: { Authorization: DISCORD_TOKEN }, params }, 3);
       const data = (resp && (resp as any).data) as any[];
       if (!Array.isArray(data)) {
         logDebug(`Polling ${displayPrefix} returned unexpected data`);
@@ -684,7 +749,7 @@ async function pollChannel(cfg: ChannelConfig): Promise<void> {
       }
 
       if (data.length === 0) {
-        logDebug(`Polling ${displayPrefix}... no new messages`);
+        logInfo(`Polling ${displayPrefix}... no new messages`);
         return;
       }
 
@@ -756,12 +821,38 @@ async function pollChannel(cfg: ChannelConfig): Promise<void> {
 
   // Staggered start: pick a random initial delay in range [0, POLL_INTERVAL_MS)
   const initialDelay = Math.floor(Math.random() * POLL_INTERVAL_MS);
+  try {
+    logInfo(`Scheduling polling for ${displayPrefix} in ${initialDelay}ms (every ${POLL_INTERVAL_MS}ms)`);
+  } catch {
+    // ignore logging failures
+  }
   setTimeout(() => {
+    try {
+      logInfo(`Starting initial poll for ${displayPrefix}`);
+    } catch {
+      // ignore
+    }
     // Perform one poll after the staggered delay, then install the regular interval.
-    // Swallow errors from the immediate poll so the interval can still be scheduled.
-    doPoll().catch(() => {});
-    setInterval(doPoll, POLL_INTERVAL_MS);
-    logDebug(`Started polling ${displayPrefix} every ${POLL_INTERVAL_MS}ms (initial delay ${initialDelay}ms)`);
+    // Report success/failure of the initial poll but always install the interval.
+    doPoll()
+      .then(() => {
+        try {
+          logInfo(`Initial poll completed for ${displayPrefix}`);
+        } catch {}
+      })
+      .catch(() => {
+        try {
+          logInfo(`Initial poll errored for ${displayPrefix} (see logs)`);
+        } catch {}
+      })
+      .finally(() => {
+        setInterval(doPoll, POLL_INTERVAL_MS);
+        try {
+          logInfo(`Started polling ${displayPrefix} every ${POLL_INTERVAL_MS}ms (initial delay ${initialDelay}ms)`);
+        } catch {}
+        // Keep the previous debug-level message for compatibility
+        logDebug(`Started polling ${displayPrefix} every ${POLL_INTERVAL_MS}ms (initial delay ${initialDelay}ms)`);
+      });
   }, initialDelay);
 }
 

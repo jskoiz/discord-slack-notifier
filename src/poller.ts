@@ -5,6 +5,7 @@ declare const process: any;
 const axios = require('axios');
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
 
 const { LOGS_DIR } = require('./config');
 const baselines = require('./baselines');
@@ -88,7 +89,7 @@ export async function sendToSlack(payloadOrText: string | { blocks: any[] }, max
       }
     }
   }
-  console.error('ERROR: Exceeded attempts to send Slack notification');
+  logger.error(' Exceeded attempts to send Slack notification');
 }
 
 /**
@@ -104,9 +105,9 @@ export async function fetchLatestMessageId(channelId: string): Promise<string | 
   } catch (err: any) {
     const s = err?.response?.status;
     if (s) {
-      console.error(`ERROR: Failed to fetch latest message for ${channelId} - ${s} ${err.response?.statusText}`);
+      logger.error(` Failed to fetch latest message for ${channelId} - ${s} ${err.response?.statusText}`);
     } else {
-      console.error(`ERROR: Failed to fetch latest message for ${channelId} - ${err?.message ?? String(err)}`);
+      logger.error(` Failed to fetch latest message for ${channelId} - ${err?.message ?? String(err)}`);
     }
     return undefined;
   }
@@ -135,7 +136,7 @@ function ensureLogsDir(): void {
   try {
     if (!fs.existsSync(LOGS_DIR)) fs.mkdirSync(LOGS_DIR, { recursive: true });
   } catch (err: any) {
-    console.error(`ERROR: Failed to ensure logs directory - ${err?.message ?? String(err)}`);
+    logger.error(` Failed to ensure logs directory - ${err?.message ?? String(err)}`);
     process.exit(1);
   }
 }
@@ -158,7 +159,7 @@ async function writeMessagesToFile(filePath: string, messages: any[]): Promise<v
     const combined = existing.concat(messages);
     fs.writeFileSync(filePath, JSON.stringify(combined, null, 2), { encoding: 'utf8' });
   } catch (err: any) {
-    console.error(`ERROR: Failed to write messages to ${filePath} - ${err?.message ?? String(err)}`);
+    logger.error(` Failed to write messages to ${filePath} - ${err?.message ?? String(err)}`);
   }
 }
 
@@ -178,10 +179,10 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
     const b = baselines.getBaseline(guildId, channelId);
     if (b && b.lastMessageId) {
       lastMessageId = String(b.lastMessageId);
-      console.debug(`Loaded baseline for ${displayPrefix}=${lastMessageId}`);
+      logger.debug(`Loaded baseline for ${displayPrefix}=${lastMessageId}`);
     }
   } catch (err: any) {
-    console.debug(`Could not read baseline for ${displayPrefix} - ${err?.message ?? String(err)}`);
+    logger.debug(`Could not read baseline for ${displayPrefix} - ${err?.message ?? String(err)}`);
   }
 
   const filePath = path.join(LOGS_DIR, `${guildId}_${channelId}.json`);
@@ -197,9 +198,9 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
           const content = typeof msgObj?.content === 'string' ? msgObj.content : undefined;
           const timestamp = typeof msgObj?.timestamp === 'string' ? msgObj.timestamp : new Date().toISOString();
           baselines.setBaseline(guildId, channelId, { lastMessageId: latest, content, timestamp });
-          console.debug(`Baseline established for ${displayPrefix}=${latest}`);
+          logger.debug(`Baseline established for ${displayPrefix}=${latest}`);
         } else {
-          console.debug(`No baseline and no messages for ${displayPrefix}`);
+          logger.debug(`No baseline and no messages for ${displayPrefix}`);
         }
         return;
       }
@@ -209,7 +210,10 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
       const resp = await axios.get(url, { headers: { Authorization: DISCORD_TOKEN }, params: { after: lastMessageId, limit: 100 }, timeout: 15000 });
       const data = resp?.data;
       if (!Array.isArray(data)) return;
-      if (data.length === 0) return;
+      if (data.length === 0) {
+        logger.info(`Polling ${displayPrefix}... no new messages`);
+        return;
+      }
 
       const ordered = data.slice().reverse();
       const toSave: any[] = [];
@@ -223,7 +227,7 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
         };
         const authorLabel = simple.author.username ?? simple.author.id;
         const truncated = simple.content.length > 200 ? simple.content.slice(0, 200) + '...' : simple.content;
-        console.info(`${displayPrefix} ${authorLabel}: ${truncated}`);
+        logger.info(`${displayPrefix} ${authorLabel}: ${truncated}`);
         toSave.push(simple);
         lastMessageId = simple.id;
       }
@@ -245,8 +249,8 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
       }
     } catch (err: any) {
       const s = err?.response?.status;
-      if (s) console.error(`ERROR: Failed to fetch ${displayPrefix} - ${s} ${err.response?.statusText}`);
-      else console.error(`ERROR: Failed to fetch ${displayPrefix} - ${err?.message ?? String(err)}`);
+      if (s) logger.error(` Failed to fetch ${displayPrefix} - ${s} ${err.response?.statusText}`);
+      else logger.error(` Failed to fetch ${displayPrefix} - ${err?.message ?? String(err)}`);
     }
   }
 
@@ -255,7 +259,7 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
   setTimeout(() => {
     doPoll().catch(() => {});
     setInterval(doPoll, POLL_INTERVAL_MS);
-    console.debug(`Started polling ${displayPrefix} every ${POLL_INTERVAL_MS}ms`);
+    logger.debug(`Started polling ${displayPrefix} every ${POLL_INTERVAL_MS}ms`);
   }, initialDelay);
 }
 
@@ -325,9 +329,9 @@ export async function enrichAndPersistChannelNames(channels: any[]): Promise<voi
     const grouped = Object.keys(groupedMap).map((k) => groupedMap[k]);
     fs.writeFileSync(path.resolve(process.cwd(), 'config', 'channels.json'), JSON.stringify(grouped, null, 2), { encoding: 'utf8' });
     // update RAW_CONFIG in baselines module not necessary here; baselines.readConfig reads on demand
-    console.debug('Wrote enriched grouped channels config');
+    logger.debug('Wrote enriched grouped channels config');
   } catch (err: any) {
-    console.error(`ERROR: enrichAndPersistChannelNames failed - ${err?.message ?? String(err)}`);
+    logger.error(` enrichAndPersistChannelNames failed - ${err?.message ?? String(err)}`);
   }
 }
 
@@ -341,7 +345,7 @@ export async function startAll(channels: any[]): Promise<void> {
     try {
       pollChannel(ch);
     } catch (err: any) {
-      console.error(`ERROR: Monitor for ${ch.guildName ?? ch.guildId}/${ch.channelName ?? ch.channelId} failed to start - ${err?.message ?? String(err)}`);
+      logger.error(` Monitor for ${ch.guildName ?? ch.guildId}/${ch.channelName ?? ch.channelId} failed to start - ${err?.message ?? String(err)}`);
     }
   }
 
@@ -421,13 +425,13 @@ export async function startAll(channels: any[]): Promise<void> {
       (async () => {
         const port = Number(process.env.PORT ?? 3000);
         await slackApp.start(port);
-        console.debug(`Slack app started on port ${port}`);
+        logger.debug(`Slack app started on port ${port}`);
       })().catch((e: any) => {
-        console.error(`ERROR: Failed to start Slack app - ${e?.message ?? String(e)}`);
+        logger.error(` Failed to start Slack app - ${e?.message ?? String(e)}`);
       });
     } catch (err: any) {
       // Slack bolt not available or failed - skip
-      console.debug(`Slack integration not available - ${err?.message ?? String(err)}`);
+      logger.debug(`Slack integration not available - ${err?.message ?? String(err)}`);
     }
   }
 }

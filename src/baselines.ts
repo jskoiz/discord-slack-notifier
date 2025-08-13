@@ -4,6 +4,7 @@ declare const process: any;
 
 const fs = require('fs');
 const path = require('path');
+const logger = require('./logger');
 
 export const CONFIG_PATH = path.resolve(process.cwd(), 'config', 'channels.json');
 export const BASELINES_PATH = path.resolve(process.cwd(), 'baselines.json');
@@ -38,7 +39,7 @@ function writeConfig(obj: any[]): void {
     fs.writeFileSync(CONFIG_PATH, JSON.stringify(obj, null, 2), { encoding: 'utf8' });
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`ERROR: Failed to persist channels config - ${msg}`);
+    logger.error(`Failed to persist channels config - ${msg}`);
   }
 }
 
@@ -108,6 +109,6 @@ export function setBaseline(guildId: string, channelId: string, entry: { lastMes
     writeConfig(parsed);
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
-    console.error(`ERROR: Failed to set baseline in channels config - ${msg}`);
+    logger.error(`Failed to set baseline in channels config - ${msg}`);
   }
 }
