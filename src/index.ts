@@ -305,9 +305,6 @@ function buildSlackBlocks(
   cfg: { guildId: string; channelId: string; guildName?: string; channelName?: string }
 ): any[] {
   const authorLabel = m.author.username ?? m.author.id;
-  // Show a generous preview but avoid extremely long Slack posts. Keep a hard cap.
-  const MAX_PREVIEW = 800;
-  const preview = m.content.length > MAX_PREVIEW ? m.content.slice(0, MAX_PREVIEW) + '...' : m.content;
 
   // Discord link to the message in a guild: https://discord.com/channels/<guildId>/<channelId>/<messageId>
   const discordLink = `https://discord.com/channels/${cfg.guildId}/${cfg.channelId}/${m.id}`;
@@ -318,8 +315,26 @@ function buildSlackBlocks(
   // Author line requested as "From: <username>"
   const authorLine = `From: ${authorLabel}`;
 
-  // If the message contains newlines, show as a code block for clearer formatting; otherwise as plain mrkdwn.
-  const messageBlockText = preview.includes('\n') ? '```' + preview + '```' : preview || '(no text)';
+  // Slack Block Kit text size limit for block text objects is roughly 3000 chars.
+  // To preserve full Discord messages we split long content into multiple section blocks.
+  const SLACK_TEXT_LIMIT = 3000;
+
+  function splitIntoChunks(s: string, size: number): string[] {
+    const out: string[] = [];
+    let i = 0;
+    while (i < s.length) {
+      out.push(s.slice(i, i + size));
+      i += size;
+    }
+    return out;
+  }
+
+  const rawContent = typeof m.content === 'string' ? m.content : '';
+  const contentToDisplay = rawContent.length > 0 ? rawContent : '(no text)';
+  const hasNewlines = contentToDisplay.includes('\n');
+
+  // Split content into Slack-safe chunks
+  const chunks = splitIntoChunks(contentToDisplay, SLACK_TEXT_LIMIT);
 
   const blocks: any[] = [
     {
@@ -329,16 +344,21 @@ function buildSlackBlocks(
         text: `${headerText}\n*${authorLine}* ${timestampText}`,
       },
     },
-    {
+  ];
+
+  // Add one section block per chunk. If original message had newlines, wrap each chunk in a code block
+  for (const chunk of chunks) {
+    const text = hasNewlines ? '```' + chunk + '```' : chunk;
+    blocks.push({
       type: 'section',
       text: {
         type: 'mrkdwn',
-        text: messageBlockText,
+        text,
       },
-    },
-  ];
+    });
+  }
 
-  // If there are attachments, and they look like images, add image blocks.
+  // If there are attachments, and they look like images, add image blocks after the message blocks.
   const imageExt = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
   if (Array.isArray(m.attachments) && m.attachments.length > 0) {
     for (const a of m.attachments) {

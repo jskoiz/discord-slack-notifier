@@ -76,9 +76,19 @@ The project recently changed how verbose polling logs are emitted to make INFO-l
 - Debug behavior (LOG_LEVEL=debug)
   - You will see the detailed per-channel "no new messages" lines and other debug diagnostics in addition to the summary and INFO-level messages.
 
+Slack message forwarding (2025-08-14 update)
+--------------------------------------------
+- Previously long Discord messages were truncated to 800 characters before sending to Slack.
+- As of this update the monitor preserves full Discord message content and forwards it to Slack.
+  - To respect Slack Block Kit text-object limits, messages are split into ~3000-character chunks and each chunk is sent as its own section block within the same webhook payload.
+  - Multi-line messages are preserved and will be wrapped in code blocks for readability.
+- Notes:
+  - Slack limits: roughly 3000 characters per text object and a maximum number of blocks per message (around 50). Extremely large single messages could exceed the block count; in that edge case the monitor may need to send multiple webhook messages (a future enhancement).
+  - Restart required: after pulling these changes, restart the monitor process so the new behavior is active.
+
 - Where the behavior is implemented
-  - Polling and summary logic: [`src/index.ts`](src/index.ts:1) and [`src/poller.ts`](src/poller.ts:1)
-  - Formatting and level handling: [`src/logger.ts`](src/logger.ts:1)
+  - Formatting / Slack block assembly: [`src/index.ts`](src/index.ts:1) and [`src/poller.ts`](src/poller.ts:1)
+  - Slack delivery and retry logic: [`src/index.ts`](src/index.ts:1) (sendToSlack)
 
 - How to change or test
   - To test quieter INFO output:
@@ -86,6 +96,9 @@ The project recently changed how verbose polling logs are emitted to make INFO-l
     - Verify you see occasional INFO summaries and INFOs for new messages/errors, but not per-channel idle lines.
   - To see the noisy per-channel lines:
     - LOG_LEVEL=debug npm run start
+  - To test full-message Slack forwarding:
+    - Post a long message in a monitored Discord channel that previously would have been truncated.
+    - Confirm the Slack webhook shows the full content (it may be split across multiple section blocks).
   - To disable the summary or change cadence, edit the poll-summary code in [`src/index.ts`](src/index.ts:1) or [`src/poller.ts`](src/poller.ts:1).
 
 Security & sensitive files

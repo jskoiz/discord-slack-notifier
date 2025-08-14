@@ -56,20 +56,45 @@ function formatTimestampToUTC(iso: string): string {
  */
 export function buildSlackBlocks(m: any, cfg: { guildId: string; channelId: string; guildName?: string; channelName?: string }): any[] {
   const authorLabel = m.author?.username ?? m.author?.id ?? 'unknown';
-  const MAX_PREVIEW = 800;
-  const preview = typeof m.content === 'string' ? (m.content.length > MAX_PREVIEW ? m.content.slice(0, MAX_PREVIEW) + '...' : m.content) : '(no text)';
+
+  // Discord link to the message in a guild: https://discord.com/channels/<guildId>/<channelId>/<messageId>
   const discordLink = `https://discord.com/channels/${cfg.guildId}/${cfg.channelId}/${m.id}`;
+
   const headerText = `*New message in* *${cfg.guildName ?? cfg.guildId}/${cfg.channelName ?? cfg.channelId}*`;
   const timestampText = `_${formatTimestampToUTC(m.timestamp)}_`;
-  const messageBlockText = preview.includes('\n') ? '```' + preview + '```' : preview;
+
+  // Slack Block Kit text size limit for block text objects is roughly 3000 chars.
+  // To preserve full Discord messages we split long content into multiple section blocks.
+  const SLACK_TEXT_LIMIT = 3000;
+
+  function splitIntoChunks(s: string, size: number): string[] {
+    const out: string[] = [];
+    let i = 0;
+    while (i < s.length) {
+      out.push(s.slice(i, i + size));
+      i += size;
+    }
+    return out;
+  }
+
+  const rawContent = typeof m.content === 'string' ? m.content : '';
+  const contentToDisplay = rawContent.length > 0 ? rawContent : '(no text)';
+  const hasNewlines = contentToDisplay.includes('\n');
+
+  // Split content into Slack-safe chunks
+  const chunks = splitIntoChunks(contentToDisplay, SLACK_TEXT_LIMIT);
 
   const blocks: any[] = [
     { type: 'section', text: { type: 'mrkdwn', text: `${headerText}\nFrom: ${authorLabel} ${timestampText}` } },
-    { type: 'section', text: { type: 'mrkdwn', text: messageBlockText } },
-    { type: 'actions', elements: [{ type: 'button', text: { type: 'plain_text', text: 'View on Discord' }, url: discordLink }] },
   ];
 
-  // minimal image handling
+  // Add one section block per chunk. If original message had newlines, wrap each chunk in a code block
+  for (const chunk of chunks) {
+    const text = hasNewlines ? '```' + chunk + '```' : chunk;
+    blocks.push({ type: 'section', text: { type: 'mrkdwn', text } });
+  }
+
+  // minimal image handling - append images after message blocks
   const imageExt = /\.(png|jpe?g|gif|webp|bmp|svg)$/i;
   if (Array.isArray(m.attachments)) {
     for (const a of m.attachments) {
@@ -77,10 +102,18 @@ export function buildSlackBlocks(m: any, cfg: { guildId: string; channelId: stri
       const filename = a?.filename ?? '';
       const looksLikeImage = (typeof url === 'string' && imageExt.test(url)) || imageExt.test(filename);
       if (looksLikeImage && url) {
-        blocks.splice(2, 0, { type: 'image', image_url: url, alt_text: filename || 'discord-image' });
+        blocks.push({ type: 'image', image_url: url, alt_text: filename || 'discord-image' });
       }
     }
   }
+
+  // actions row with button
+  blocks.push({
+    type: 'actions',
+    elements: [
+      { type: 'button', text: { type: 'plain_text', text: 'View on Discord' }, url: discordLink },
+    ],
+  });
 
   return blocks;
 }
