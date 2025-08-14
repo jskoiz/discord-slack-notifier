@@ -302,7 +302,7 @@ function formatTimestampToUTC(iso: string): string {
  */
 function buildSlackBlocks(
   m: DiscordMessage,
-  cfg: { guildId: string; channelId: string; guildName?: string; channelName?: string }
+  cfg: { guildId: string; channelId: string; guildName?: string; guildIcon?: string; channelName?: string }
 ): any[] {
   const authorLabel = m.author.username ?? m.author.id;
 
@@ -336,15 +336,31 @@ function buildSlackBlocks(
   // Split content into Slack-safe chunks
   const chunks = splitIntoChunks(contentToDisplay, SLACK_TEXT_LIMIT);
 
-  const blocks: any[] = [
-    {
-      type: 'section',
-      text: {
-        type: 'mrkdwn',
-        text: `${headerText}\n*${authorLine}* ${timestampText}`,
-      },
-    },
-  ];
+  const blocks: any[] = [];
+  if (cfg.guildIcon) {
+    const ext = String(cfg.guildIcon).startsWith('a_') ? 'gif' : 'png';
+    const iconUrl = `https://cdn.discordapp.com/icons/${cfg.guildId}/${cfg.guildIcon}.${ext}?size=96`;
+    blocks.push({
+      type: 'context',
+      elements: [
+        { type: 'image', image_url: iconUrl, alt_text: cfg.guildName ?? 'guild' },
+        {
+          type: 'mrkdwn',
+          text: `${headerText}\n*${authorLine}* ${timestampText}`,
+        },
+      ],
+    });
+  } else {
+    blocks.push({
+      type: 'context',
+      elements: [
+        {
+          type: 'mrkdwn',
+          text: `${headerText}\n*${authorLine}* ${timestampText}`,
+        },
+      ],
+    });
+  }
 
   // Add one section block per chunk. If original message had newlines, wrap each chunk in a code block
   for (const chunk of chunks) {
@@ -441,6 +457,7 @@ interface ChannelConfig {
   guildId: string;
   channelId: string;
   guildName?: string;
+  guildIcon?: string;
   channelName?: string;
 }
 
@@ -462,6 +479,7 @@ interface ChannelConfig {
 interface RawGuildEntry {
   guild: string;
   guildName?: string;
+  guildIcon?: string;
   channels: { channel: string; channelName?: string }[];
 }
 
@@ -500,16 +518,18 @@ function loadChannels(filePath: string): ChannelConfig[] {
       const obj = entry as any;
 
       // Support new grouped guild-based shape:
-      // { guild: "...", guildName?: "...", channels: [{ channel: "..." , channelName?: "..." }, ...] }
+      // { guild: "...", guildName?: "...", guildIcon?: "...", channels: [{ channel: "..." , channelName?: "..." }, ...] }
       if (typeof obj.guild === 'string' && Array.isArray(obj.channels)) {
         const guildId = obj.guild;
         const guildName = typeof obj.guildName === 'string' ? obj.guildName : undefined;
+        const guildIcon = typeof obj.guildIcon === 'string' ? obj.guildIcon : undefined;
         for (const ch of obj.channels) {
           if (typeof ch.channel === 'string') {
             flattened.push({
               guildId,
               channelId: ch.channel,
               guildName,
+              guildIcon,
               channelName: typeof ch.channelName === 'string' ? ch.channelName : undefined,
             } as ChannelConfig);
           } else {
@@ -520,12 +540,13 @@ function loadChannels(filePath: string): ChannelConfig[] {
       }
 
       // Support legacy flat shape:
-      // { guildId: "...", channelId: "..." }
+      // { guildId: "...", channelId: "...", guildIcon?: "..." }
       if (typeof obj.guildId === 'string' && typeof obj.channelId === 'string') {
         flattened.push({
           guildId: obj.guildId,
           channelId: obj.channelId,
           guildName: typeof obj.guildName === 'string' ? obj.guildName : undefined,
+          guildIcon: typeof obj.guildIcon === 'string' ? obj.guildIcon : undefined,
           channelName: typeof obj.channelName === 'string' ? obj.channelName : undefined,
         } as ChannelConfig);
         continue;
@@ -599,17 +620,19 @@ async function enrichAndPersistChannelNames(): Promise<void> {
       logDebug(`Failed to fetch channel name for ${ch.channelId} - ${msg}`);
     }
 
-    // fetch guild name
+    // fetch guild name and icon (if available)
     try {
       const gResp = await requestWithRetries('get', `https://discord.com/api/v10/guilds/${ch.guildId}`, {
         headers: { Authorization: DISCORD_TOKEN },
       }, 3);
-      if (gResp && (gResp as any).data && typeof (gResp as any).data.name === 'string') {
-        updatedCh.guildName = (gResp as any).data.name;
+      if (gResp && (gResp as any).data) {
+        const gd = (gResp as any).data;
+        if (typeof gd.name === 'string') updatedCh.guildName = gd.name;
+        if (typeof gd.icon === 'string') updatedCh.guildIcon = gd.icon;
       }
     } catch (err: unknown) {
       const msg = err instanceof Error ? err.message : String(err);
-      logDebug(`Failed to fetch guild name for ${ch.guildId} - ${msg}`);
+      logDebug(`Failed to fetch guild name/icon for ${ch.guildId} - ${msg}`);
     }
 
     try {
@@ -630,12 +653,16 @@ const groupedMap: Record<string, RawGuildEntry> = {};
       groupedMap[c.guildId] = {
         guild: c.guildId,
         guildName: c.guildName,
+        guildIcon: c.guildIcon,
         channels: [],
       };
     }
-    // Prefer any newly fetched guildName
+    // Prefer any newly fetched guildName/guildIcon
     if (typeof c.guildName === 'string') {
       groupedMap[c.guildId].guildName = c.guildName;
+    }
+    if (typeof c.guildIcon === 'string') {
+      groupedMap[c.guildId].guildIcon = c.guildIcon;
     }
 
     // Preserve any existing baseline from RAW_CONFIG if present
@@ -1031,6 +1058,7 @@ async function pollChannel(cfg: ChannelConfig): Promise<void> {
                 guildId,
                 channelId,
                 guildName: cfg.guildName,
+                guildIcon: cfg.guildIcon,
                 channelName: cfg.channelName,
               });
               // Diagnostic: log just before sending to Slack (helps detect duplicate senders)

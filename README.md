@@ -82,6 +82,11 @@ Slack message forwarding (2025-08-14 update)
 - As of this update the monitor preserves full Discord message content and forwards it to Slack.
   - To respect Slack Block Kit text-object limits, messages are split into ~3000-character chunks and each chunk is sent as its own section block within the same webhook payload.
   - Multi-line messages are preserved and will be wrapped in code blocks for readability.
+- Guild thumbnails & header layout:
+  - The Slack notification header now includes a small left-aligned guild thumbnail (when available) inline with the guild/channel and author/time text using a Slack "context" block.
+  - The icon is built from the Discord CDN using the guild ID and the guild icon hash (guildIcon). Animated icons (hashes starting with `a_`) are rendered as `.gif`; otherwise `.png` is used. Size is requested at 96px.
+  - The monitor fetches and persistently stores a guild's icon hash during the enrichment step when WRITE_ENRICHED_CONFIG=true. Existing configs remain compatible; you can also add a "guildIcon" (icon hash) manually to your grouped config to enable thumbnails immediately.
+  - If no guild icon is available, the header falls back to plain text without an image accessory.
 - Notes:
   - Slack limits: roughly 3000 characters per text object and a maximum number of blocks per message (around 50). Extremely large single messages could exceed the block count; in that edge case the monitor may need to send multiple webhook messages (a future enhancement).
   - Restart required: after pulling these changes, restart the monitor process so the new behavior is active.
@@ -127,7 +132,7 @@ Troubleshooting
 
 Changelog (high level)
 ----------------------
-- 2025-08-14 — logging: demote idle per-channel "no new messages" to DEBUG and add a periodic INFO summary of polling cycles.
+- 2025-08-14 — Slack: include guild thumbnails in the Slack header (left-aligned context block); enrichment now fetches and can persist "guildIcon" hashes to [`config/channels.json`](config/channels.json:1). Also: logging — demote idle per-channel "no new messages" to DEBUG and add a periodic INFO summary of polling cycles.
 - 2025-08-11 — v0.1.0: grouped config shape, enrichment, improved logging.
 
 License

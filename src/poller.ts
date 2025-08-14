@@ -54,7 +54,7 @@ function formatTimestampToUTC(iso: string): string {
 /**
  * Build a very small Slack Block Kit payload for a Discord message.
  */
-export function buildSlackBlocks(m: any, cfg: { guildId: string; channelId: string; guildName?: string; channelName?: string }): any[] {
+export function buildSlackBlocks(m: any, cfg: { guildId: string; channelId: string; guildName?: string; guildIcon?: string; channelName?: string }): any[] {
   const authorLabel = m.author?.username ?? m.author?.id ?? 'unknown';
 
   // Discord link to the message in a guild: https://discord.com/channels/<guildId>/<channelId>/<messageId>
@@ -84,9 +84,25 @@ export function buildSlackBlocks(m: any, cfg: { guildId: string; channelId: stri
   // Split content into Slack-safe chunks
   const chunks = splitIntoChunks(contentToDisplay, SLACK_TEXT_LIMIT);
 
-  const blocks: any[] = [
-    { type: 'section', text: { type: 'mrkdwn', text: `${headerText}\nFrom: ${authorLabel} ${timestampText}` } },
-  ];
+  const blocks: any[] = [];
+  if (cfg.guildIcon) {
+    const ext = String(cfg.guildIcon).startsWith('a_') ? 'gif' : 'png';
+    const iconUrl = `https://cdn.discordapp.com/icons/${cfg.guildId}/${cfg.guildIcon}.${ext}?size=96`;
+    blocks.push({
+      type: 'context',
+      elements: [
+        { type: 'image', image_url: iconUrl, alt_text: cfg.guildName ?? 'guild' },
+        { type: 'mrkdwn', text: `${headerText}\nFrom: ${authorLabel} ${timestampText}` },
+      ],
+    });
+  } else {
+    blocks.push({
+      type: 'context',
+      elements: [
+        { type: 'mrkdwn', text: `${headerText}\nFrom: ${authorLabel} ${timestampText}` },
+      ],
+    });
+  }
 
   // Add one section block per chunk. If original message had newlines, wrap each chunk in a code block
   for (const chunk of chunks) {
@@ -219,7 +235,7 @@ async function writeMessagesToFile(filePath: string, messages: any[]): Promise<v
 /**
  * Poll a single channel configuration (flattened ChannelConfig)
  */
-export function pollChannel(cfg: { guildId: string; channelId: string; guildName?: string; channelName?: string }): void {
+export function pollChannel(cfg: { guildId: string; channelId: string; guildName?: string; guildIcon?: string; channelName?: string }): void {
   const { guildId, channelId } = cfg;
   const displayGuild = cfg.guildName ?? guildId;
   const displayChannel = cfg.channelName ?? channelId;
@@ -295,7 +311,7 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
         // notify to Slack sequentially to preserve order
         for (const m of toSave) {
           try {
-            const blocks = buildSlackBlocks(m, { guildId, channelId, guildName: cfg.guildName, channelName: cfg.channelName });
+            const blocks = buildSlackBlocks(m, { guildId, channelId, guildName: cfg.guildName, guildIcon: cfg.guildIcon, channelName: cfg.channelName });
             // Diagnostic: log just before sending to Slack (helps detect duplicate senders)
             try {
               logger.debug(`sendToSlack: guildId=${guildId} channelId=${channelId} messageId=${m.id}`);
