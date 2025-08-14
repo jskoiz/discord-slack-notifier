@@ -14,6 +14,26 @@ const DISCORD_TOKEN = process.env.DISCORD_TOKEN;
 const SLACK_WEBHOOK_URL = process.env.SLACK_WEBHOOK_URL;
 const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? '3000');
 
+// Poll summary tracker: aggregate poll completions and durations and emit a single
+// INFO-level summary every POLL_INTERVAL_MS. Individual per-channel "no new messages"
+// lines are demoted to DEBUG so INFO-level stays quiet unless new activity/errors occur.
+let _pollsCompletedSinceLastSummary = 0;
+let _pollsTotalTimeMs = 0;
+setInterval(() => {
+  try {
+    const count = _pollsCompletedSinceLastSummary;
+    const total = _pollsTotalTimeMs;
+    // reset counters for next window
+    _pollsCompletedSinceLastSummary = 0;
+    _pollsTotalTimeMs = 0;
+    if (count > 0) {
+      logger.info(`Completed polling cycle for ${count} channels in ${total}ms`);
+    }
+  } catch {
+    // swallow - telemetry must not crash the app
+  }
+}, POLL_INTERVAL_MS);
+
 /**
  * Simple timestamp formatter used in Slack messages.
  */
@@ -188,6 +208,7 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
   const filePath = path.join(LOGS_DIR, `${guildId}_${channelId}.json`);
 
   async function doPoll(): Promise<void> {
+    const pollStart = Date.now();
     try {
       // if no baseline try to establish quietly
       if (!lastMessageId) {
@@ -204,17 +225,18 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
         }
         return;
       }
-
+  
       // fetch messages after lastMessageId
       const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
       const resp = await axios.get(url, { headers: { Authorization: DISCORD_TOKEN }, params: { after: lastMessageId, limit: 100 }, timeout: 15000 });
       const data = resp?.data;
       if (!Array.isArray(data)) return;
       if (data.length === 0) {
-        logger.info(`Polling ${displayPrefix}... no new messages`);
+        // Demote noisy "no new messages" to DEBUG so INFO-level logs only show activity/errors.
+        logger.debug(`Polling ${displayPrefix}... no new messages`);
         return;
       }
-
+  
       const ordered = data.slice().reverse();
       const toSave: any[] = [];
       for (const msg of ordered) {
@@ -231,16 +253,22 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
         toSave.push(simple);
         lastMessageId = simple.id;
       }
-
+  
       if (toSave.length > 0) {
         await writeMessagesToFile(filePath, toSave);
         const newest = toSave[toSave.length - 1];
         baselines.setBaseline(guildId, channelId, { lastMessageId: newest.id, content: newest.content, timestamp: newest.timestamp });
-
+  
         // notify to Slack sequentially to preserve order
         for (const m of toSave) {
           try {
             const blocks = buildSlackBlocks(m, { guildId, channelId, guildName: cfg.guildName, channelName: cfg.channelName });
+            // Diagnostic: log just before sending to Slack (helps detect duplicate senders)
+            try {
+              logger.debug(`sendToSlack: guildId=${guildId} channelId=${channelId} messageId=${m.id}`);
+            } catch {
+              // ignore logging failures
+            }
             await sendToSlack({ blocks });
           } catch {
             // ignore notification errors
@@ -251,6 +279,15 @@ export function pollChannel(cfg: { guildId: string; channelId: string; guildName
       const s = err?.response?.status;
       if (s) logger.error(` Failed to fetch ${displayPrefix} - ${s} ${err.response?.statusText}`);
       else logger.error(` Failed to fetch ${displayPrefix} - ${err?.message ?? String(err)}`);
+    } finally {
+      // Always track that a poll ran (successful or not) so the periodic summary can report activity.
+      try {
+        const elapsed = Date.now() - pollStart;
+        _pollsCompletedSinceLastSummary += 1;
+        _pollsTotalTimeMs += elapsed;
+      } catch {
+        // swallow
+      }
     }
   }
 

@@ -126,6 +126,139 @@ const POLL_INTERVAL_MS = Number(process.env.POLL_INTERVAL_MS ?? '3000');
 // the watched config file during startup — otherwise the watcher will restart
 // the process repeatedly. Detect common env vars used by dev runners.
 const IS_DEV_WATCH = Boolean(process.env.TS_NODE_DEV || process.env.NODE_ENV === 'development');
+// Control whether enriched/grouped config should be written back to disk.
+// Make this opt-in to avoid triggering dev file-watchers (default: false).
+const WRITE_ENRICHED_CONFIG = Boolean(process.env.WRITE_ENRICHED_CONFIG === 'true' || process.env.WRITE_ENRICHED_CONFIG === '1');
+
+// Poll summary tracker: aggregate poll completions and durations and emit a single
+// INFO-level summary every POLL_INTERVAL_MS. Individual per-channel "no new messages"
+// lines are demoted to DEBUG so INFO-level stays quiet unless new activity/errors occur.
+let _pollsCompletedSinceLastSummary = 0;
+let _pollsTotalTimeMs = 0;
+setInterval(() => {
+  try {
+    const count = _pollsCompletedSinceLastSummary;
+    const total = _pollsTotalTimeMs;
+    // reset counters for next window
+    _pollsCompletedSinceLastSummary = 0;
+    _pollsTotalTimeMs = 0;
+    if (count > 0) {
+      logInfo(`Completed polling cycle for ${count} channels in ${total}ms`);
+    }
+  } catch {
+    // swallow - telemetry must not crash the app
+  }
+}, POLL_INTERVAL_MS);
+
+/**
+ * Single-instance enforcement.
+ *
+ * Behavior:
+ * - Uses a PID file at repository root ('.discord-monitor.pid').
+ * - If the PID file contains other PIDs, attempts to terminate them (SIGTERM then SIGKILL).
+ * - Writes current PID into the PID file and ensures cleanup on exit/signals.
+ *
+ * Rationale:
+ * Prevents duplicate monitors from running (and sending duplicate notifications).
+ */
+const PID_PATH = path.resolve(process.cwd(), '.discord-monitor.pid');
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    // signal 0 does not kill the process; it throws if process does not exist or permission denied
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}
+
+function tryTerminate(pid: number): void {
+  try {
+    // Prefer graceful shutdown first
+    process.kill(pid, 'SIGTERM');
+    logDebug(`Sent SIGTERM to PID=${pid}`);
+  } catch (e) {
+    logDebug(`SIGTERM failed for PID=${pid} - ${e instanceof Error ? e.message : String(e)}`);
+  }
+  try {
+    // Force kill as a fallback
+    process.kill(pid, 'SIGKILL');
+    logDebug(`Sent SIGKILL to PID=${pid}`);
+  } catch (e) {
+    logDebug(`SIGKILL failed for PID=${pid} - ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
+function ensureSingleInstance(): void {
+  try {
+    // Read existing PIDs (allow multiple lines if present)
+    if (fs.existsSync(PID_PATH)) {
+      try {
+        const raw = fs.readFileSync(PID_PATH, { encoding: 'utf8' });
+        const parts = raw.split(/\s+/).filter(Boolean);
+        for (const p of parts) {
+          const pid = Number(p);
+          if (!Number.isFinite(pid) || pid === process.pid) continue;
+          if (isProcessAlive(pid)) {
+            logInfo(`Found other instance PID=${pid}; attempting to terminate`);
+            tryTerminate(pid);
+          }
+        }
+      } catch (err: unknown) {
+        logDebug(`Failed to read or parse PID file ${PID_PATH} - ${err instanceof Error ? err.message : String(err)}`);
+      }
+    }
+
+    // Write our PID (overwrite). Keep single-line format for simplicity.
+    try {
+      fs.writeFileSync(PID_PATH, String(process.pid) + '\n', { encoding: 'utf8' });
+      logDebug(`Wrote PID ${process.pid} to ${PID_PATH}`);
+    } catch (err: unknown) {
+      logError(`Failed to write PID file ${PID_PATH} - ${err instanceof Error ? err.message : String(err)}`);
+    }
+
+    // Cleanup handlers: remove pid file (or remove our pid from it) on exit/signals.
+    const cleanup = () => {
+      try {
+        if (!fs.existsSync(PID_PATH)) return;
+        const cur = fs.readFileSync(PID_PATH, { encoding: 'utf8' });
+        const remaining = cur
+          .split(/\s+/)
+          .filter(Boolean)
+          .filter((s: string) => s !== String(process.pid));
+        if (remaining.length > 0) {
+          fs.writeFileSync(PID_PATH, remaining.join('\n') + '\n', { encoding: 'utf8' });
+        } else {
+          fs.unlinkSync(PID_PATH);
+        }
+        logDebug(`Cleaned up PID file ${PID_PATH} for PID=${process.pid}`);
+      } catch {
+        // swallow - do not throw from cleanup
+      }
+    };
+
+    process.on('exit', cleanup);
+    // handle common termination signals
+    ['SIGINT', 'SIGTERM', 'SIGHUP', 'SIGQUIT'].forEach((sig) => {
+      try {
+        process.on(sig as any, () => {
+          cleanup();
+          // re-raise default behavior by exiting
+          try {
+            process.exit(0);
+          } catch {
+            // swallow
+          }
+        });
+      } catch {
+        // some signals may not be available on all platforms; ignore
+      }
+    });
+  } catch (err: unknown) {
+    logDebug(`ensureSingleInstance failed - ${err instanceof Error ? err.message : String(err)}`);
+  }
+}
 
 function logInfo(message: string): void {
   logger.info(message);
@@ -394,6 +527,25 @@ function loadChannels(filePath: string): ChannelConfig[] {
 }
 
 const channels = loadChannels(CONFIG_PATH);
+try {
+  // Startup diagnostics: PID and flattened channels summary
+  logInfo(`Process PID=${process.pid} starting with ${channels.length} channel(s)`);
+  try {
+    const flatSummary = channels.map((c) => ({
+      guildId: c.guildId,
+      channelId: c.channelId,
+      guildName: c.guildName ?? null,
+      channelName: c.channelName ?? null,
+    }));
+    logDebug(`Flattened channels: ${JSON.stringify(flatSummary)}`);
+    const keys = channels.map((c) => `${c.guildId}_${c.channelId}`).join(', ');
+    logDebug(`Channel baseline keys: ${keys}`);
+  } catch {
+    // swallow any logging serialization issues
+  }
+} catch {
+  // keep startup diagnostics non-fatal
+}
 
 async function enrichAndPersistChannelNames(): Promise<void> {
   const updated: ChannelConfig[] = [];
@@ -494,17 +646,21 @@ const groupedMap: Record<string, RawGuildEntry> = {};
   const grouped: RawGuildEntry[] = Object.keys(groupedMap).map((k) => groupedMap[k]);
 
   try {
-    if (IS_DEV_WATCH) {
-      // Avoid modifying watched config files during development hot-reload.
-      logDebug(`Skipping writing enriched grouped channels config to disk (dev watch mode)`);
-    } else {
+    if (WRITE_ENRICHED_CONFIG) {
       fs.writeFileSync(CONFIG_PATH, JSON.stringify(grouped, null, 2), { encoding: 'utf8' });
       logDebug(`Wrote enriched (grouped) channels config with names to ${CONFIG_PATH}`);
-    }
-    try {
-      logInfo(`Finished enrichment and wrote ${Object.keys(groupedMap).length} guild(s) to ${CONFIG_PATH}`);
-    } catch {
-      // ignore
+      try {
+        logInfo(`Finished enrichment and wrote ${Object.keys(groupedMap).length} guild(s) to ${CONFIG_PATH}`);
+      } catch {
+        // ignore
+      }
+    } else {
+      logDebug(`Skipping writing enriched grouped channels config to disk (WRITE_ENRICHED_CONFIG not set)`);
+      try {
+        logInfo(`Finished enrichment (not written to disk) — set WRITE_ENRICHED_CONFIG=true to persist changes`);
+      } catch {
+        // ignore
+      }
     }
     // ensure in-memory flattened channels reflect the enriched names
     channels.splice(0, channels.length, ...updated);
@@ -576,27 +732,52 @@ function findChannelEntryInRaw(guildId: string, channelId: string): { guildEntry
  * For migration safety we fallback to the legacy baselines.json if no baseline is present in the config.
  */
 function getBaseline(guildId: string, channelId: string): any | undefined {
-  // first try to read from RAW_CONFIG (channels.json)
+  // Read embedded baseline (config/channels.json / RAW_CONFIG) if present
+  let embedded: any | undefined;
   try {
     const { channelEntry } = findChannelEntryInRaw(guildId, channelId);
-    if (channelEntry && channelEntry.baseline) return channelEntry.baseline;
+    if (channelEntry && channelEntry.baseline) embedded = channelEntry.baseline;
   } catch {
-    // ignore and fallback
+    // ignore and continue to legacy fallback
   }
 
-  // fallback to legacy baselines.json for migration
+  // Read legacy baselines.json if present
+  let legacy: any | undefined;
   try {
     if (fs.existsSync(BASELINES_PATH)) {
       const raw = fs.readFileSync(BASELINES_PATH, { encoding: 'utf8' });
       const parsed = JSON.parse(raw);
       const k = baselineKey(guildId, channelId);
-      if (parsed && typeof parsed === 'object' && parsed[k]) return parsed[k];
+      if (parsed && typeof parsed === 'object' && parsed[k]) legacy = parsed[k];
     }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     logDebug(`Failed to read legacy baselines.json - ${msg}`);
   }
-  return undefined;
+
+  // If both exist, choose the most recent by timestamp when available.
+  // This avoids repeatedly re-processing the same messages when channels.json
+  // contains an older baseline but baselines.json has been updated.
+  if (embedded && legacy) {
+    try {
+      const eTs = typeof embedded.timestamp === 'string' ? Date.parse(embedded.timestamp) : NaN;
+      const lTs = typeof legacy.timestamp === 'string' ? Date.parse(legacy.timestamp) : NaN;
+      if (!isNaN(eTs) && !isNaN(lTs)) {
+        return lTs >= eTs ? legacy : embedded;
+      }
+      // If only one has a valid timestamp, prefer that one
+      if (!isNaN(lTs) && isNaN(eTs)) return legacy;
+      if (!isNaN(eTs) && isNaN(lTs)) return embedded;
+    } catch {
+      // fallthrough to prefer legacy as a safe default
+    }
+    // Prefer legacy baseline when timestamps are not comparable — it's the store
+    // the runtime currently persists to by default (when WRITE_ENRICHED_CONFIG is false).
+    return legacy;
+  }
+
+  // If only one exists, return it; otherwise undefined.
+  return embedded ?? legacy ?? undefined;
 }
 
 function persistConfig(): void {
@@ -618,6 +799,7 @@ function persistConfig(): void {
  */
 function setBaseline(guildId: string, channelId: string, entry: { lastMessageId: string; content?: string; timestamp?: string }): void {
   try {
+    // Always update in-memory RAW_CONFIG so runtime can read latest baseline immediately.
     let guildObj = RAW_CONFIG.find((g: any) => String(g.guild) === String(guildId));
     if (!guildObj) {
       guildObj = { guild: guildId, channels: [] };
@@ -630,7 +812,34 @@ function setBaseline(guildId: string, channelId: string, entry: { lastMessageId:
       guildObj.channels.push(ch);
     }
     ch.baseline = entry;
-    persistConfig();
+
+    // Persist baseline to disk.
+    // - If WRITE_ENRICHED_CONFIG is true we persist the grouped RAW_CONFIG back to config/channels.json
+    //   (this may trigger file-watchers; opt-in).
+    // - Otherwise persist only to a legacy baselines.json file (safe for dev/watchers).
+    if (WRITE_ENRICHED_CONFIG) {
+      persistConfig();
+    } else {
+      try {
+        // Write per-channel baseline to a small key->entry map in baselines.json.
+        let existing: any = {};
+        if (fs.existsSync(BASELINES_PATH)) {
+          try {
+            const raw = fs.readFileSync(BASELINES_PATH, { encoding: 'utf8' });
+            existing = JSON.parse(raw) || {};
+          } catch {
+            existing = {};
+          }
+        }
+        const k = baselineKey(guildId, channelId);
+        existing[k] = entry;
+        fs.writeFileSync(BASELINES_PATH, JSON.stringify(existing, null, 2), { encoding: 'utf8' });
+        logDebug(`Persisted baseline for ${guildId}/${channelId} to legacy baselines.json`);
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err);
+        logError(`Failed to persist baseline to ${BASELINES_PATH} - ${msg}`);
+      }
+    }
   } catch (err: unknown) {
     const msg = err instanceof Error ? err.message : String(err);
     logError(`Failed to set baseline in channels config - ${msg}`);
@@ -722,99 +931,118 @@ async function pollChannel(cfg: ChannelConfig): Promise<void> {
   }
 
   async function doPoll(): Promise<void> {
-    const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
-    const params: Record<string, string | number> = lastMessageId ? { after: lastMessageId, limit: 100 } : { limit: 1 };
+    const pollStart = Date.now();
     try {
-      const resp = await requestWithRetries('get', url, { headers: { Authorization: DISCORD_TOKEN }, params }, 3);
-      const data = (resp && (resp as any).data) as any[];
-      if (!Array.isArray(data)) {
-        logDebug(`Polling ${displayPrefix} returned unexpected data`);
-        return;
-      }
-
-      if (!lastMessageId) {
-        // set baseline quietly if possible
-        if (data.length > 0) {
-          lastMessageId = String(data[0].id);
-          // persist baseline with content if available
-          const msgObj = data[0];
-          const content = typeof msgObj?.content === 'string' ? msgObj.content : undefined;
-          const timestamp = typeof msgObj?.timestamp === 'string' ? msgObj.timestamp : new Date().toISOString();
-          setBaseline(guildId, channelId, { lastMessageId: lastMessageId, content, timestamp });
-          logDebug(`Set initial lastMessageId for ${displayPrefix} = ${lastMessageId} (persisted)`);
-        } else {
-          logDebug(`Polling ${displayPrefix}... no messages to establish baseline`);
+      const url = `https://discord.com/api/v10/channels/${channelId}/messages`;
+      const params: Record<string, string | number> = lastMessageId ? { after: lastMessageId, limit: 100 } : { limit: 1 };
+      try {
+        const resp = await requestWithRetries('get', url, { headers: { Authorization: DISCORD_TOKEN }, params }, 3);
+        const data = (resp && (resp as any).data) as any[];
+        if (!Array.isArray(data)) {
+          logDebug(`Polling ${displayPrefix} returned unexpected data`);
+          return;
         }
-        return;
-      }
-
-      if (data.length === 0) {
-        logInfo(`Polling ${displayPrefix}... no new messages`);
-        return;
-      }
-
-      // Discord returns newest->oldest; process oldest->newest
-      const ordered = data.slice().reverse();
-      const toSave: DiscordMessage[] = [];
-      for (const msg of ordered) {
-        const simple: DiscordMessage = {
-          id: String(msg.id),
-          author: {
-            id: String(msg.author?.id ?? ''),
-            username: typeof msg.author?.username === 'string' ? msg.author.username : null,
-          },
-          content: typeof msg.content === 'string' ? msg.content : '',
-          timestamp: String(msg.timestamp ?? new Date().toISOString()),
-          attachments: Array.isArray(msg.attachments)
-            ? msg.attachments.map((a: any) => ({
-                id: a?.id,
-                url: a?.url,
-                proxy_url: a?.proxy_url,
-                filename: a?.filename,
-                content_type: a?.content_type,
-              }))
-            : undefined,
-        };
-        // CLI info log (condensed, one line)
-        const authorLabel = simple.author.username ?? simple.author.id;
-        const truncated = simple.content.length > 200 ? simple.content.slice(0, 200) + '...' : simple.content;
-        logInfo(`${displayPrefix} ${authorLabel}: ${truncated}`);
-        toSave.push(simple);
-        lastMessageId = simple.id;
-      }
-
-      if (toSave.length > 0) {
-        await writeMessagesToFile(toSave);
-        logDebug(`Persisted ${toSave.length} message(s) for ${guildId}/${channelId}`);
-
-        // update baseline to the newest message we processed
-        const newest = toSave[toSave.length - 1];
-        setBaseline(guildId, channelId, { lastMessageId: newest.id, content: newest.content, timestamp: newest.timestamp });
-
-        // Send each new message to Slack (one Slack message per Discord message)
-        for (const m of toSave) {
-          try {
-            // Build a Block Kit payload for richer formatting and a link back to Discord
-            const blocks = buildSlackBlocks(m, {
-              guildId,
-              channelId,
-              guildName: cfg.guildName,
-              channelName: cfg.channelName,
-            });
-            // await to keep order and let sendToSlack honor rate-limits/retries
-            await sendToSlack({ blocks });
-          } catch (err: unknown) {
-            logDebug('Error while sending Slack notification for a message');
+    
+        if (!lastMessageId) {
+          // set baseline quietly if possible
+          if (data.length > 0) {
+            lastMessageId = String(data[0].id);
+            // persist baseline with content if available
+            const msgObj = data[0];
+            const content = typeof msgObj?.content === 'string' ? msgObj.content : undefined;
+            const timestamp = typeof msgObj?.timestamp === 'string' ? msgObj.timestamp : new Date().toISOString();
+            setBaseline(guildId, channelId, { lastMessageId: lastMessageId, content, timestamp });
+            logDebug(`Set initial lastMessageId for ${displayPrefix} = ${lastMessageId} (persisted)`);
+          } else {
+            logDebug(`Polling ${displayPrefix}... no messages to establish baseline`);
+          }
+          return;
+        }
+    
+        if (data.length === 0) {
+          // Demote noisy "no new messages" to DEBUG so INFO-level logs only show activity/errors.
+          logDebug(`Polling ${displayPrefix}... no new messages`);
+          return;
+        }
+    
+        // Discord returns newest->oldest; process oldest->newest
+        const ordered = data.slice().reverse();
+        const toSave: DiscordMessage[] = [];
+        for (const msg of ordered) {
+          const simple: DiscordMessage = {
+            id: String(msg.id),
+            author: {
+              id: String(msg.author?.id ?? ''),
+              username: typeof msg.author?.username === 'string' ? msg.author.username : null,
+            },
+            content: typeof msg.content === 'string' ? msg.content : '',
+            timestamp: String(msg.timestamp ?? new Date().toISOString()),
+            attachments: Array.isArray(msg.attachments)
+              ? msg.attachments.map((a: any) => ({
+                  id: a?.id,
+                  url: a?.url,
+                  proxy_url: a?.proxy_url,
+                  filename: a?.filename,
+                  content_type: a?.content_type,
+                }))
+              : undefined,
+          };
+          // CLI info log (condensed, one line) for actual new messages only
+          const authorLabel = simple.author.username ?? simple.author.id;
+          const truncated = simple.content.length > 200 ? simple.content.slice(0, 200) + '...' : simple.content;
+          logInfo(`${displayPrefix} ${authorLabel}: ${truncated}`);
+          toSave.push(simple);
+          lastMessageId = simple.id;
+        }
+    
+        if (toSave.length > 0) {
+          await writeMessagesToFile(toSave);
+          logDebug(`Persisted ${toSave.length} message(s) for ${guildId}/${channelId}`);
+    
+          // update baseline to the newest message we processed
+          const newest = toSave[toSave.length - 1];
+          setBaseline(guildId, channelId, { lastMessageId: newest.id, content: newest.content, timestamp: newest.timestamp });
+    
+          // Send each new message to Slack (one Slack message per Discord message)
+          for (const m of toSave) {
+            try {
+              // Build a Block Kit payload for richer formatting and a link back to Discord
+              const blocks = buildSlackBlocks(m, {
+                guildId,
+                channelId,
+                guildName: cfg.guildName,
+                channelName: cfg.channelName,
+              });
+              // Diagnostic: log just before sending to Slack (helps detect duplicate senders)
+              try {
+                logDebug(`sendToSlack: guildId=${guildId} channelId=${channelId} messageId=${m.id}`);
+              } catch {
+                // ignore logging failures
+              }
+              // await to keep order and let sendToSlack honor rate-limits/retries
+              await sendToSlack({ blocks });
+            } catch (err: unknown) {
+              logDebug('Error while sending Slack notification for a message');
+            }
           }
         }
+      } catch (err: unknown) {
+        const anyErr = err as any;
+        if (anyErr && anyErr.response) {
+          logError(`Failed to fetch ${displayPrefix} - ${anyErr.response.status} ${anyErr.response.statusText}`);
+        } else {
+          const msg = err instanceof Error ? err.message : String(err);
+          logError(`Failed to fetch ${displayPrefix} - ${msg}`);
+        }
       }
-    } catch (err: unknown) {
-      const anyErr = err as any;
-      if (anyErr && anyErr.response) {
-        logError(`Failed to fetch ${displayPrefix} - ${anyErr.response.status} ${anyErr.response.statusText}`);
-      } else {
-        const msg = err instanceof Error ? err.message : String(err);
-        logError(`Failed to fetch ${displayPrefix} - ${msg}`);
+    } finally {
+      // Always track that a poll ran (successful or not) so the periodic summary can report activity.
+      try {
+        const elapsed = Date.now() - pollStart;
+        _pollsCompletedSinceLastSummary += 1;
+        _pollsTotalTimeMs += elapsed;
+      } catch {
+        // swallow
       }
     }
   }

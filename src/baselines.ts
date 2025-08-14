@@ -66,25 +66,49 @@ function findChannelInConfig(parsed: any[], guildId: string, channelId: string):
  * - Fallback to legacy baselines.json (migration safety)
  */
 export function getBaseline(guildId: string, channelId: string): any | undefined {
+  // Read embedded baseline from config/channels.json first (if present)
+  let embedded: any | undefined;
   try {
     const parsed = readConfig();
     const { channelEntry } = findChannelInConfig(parsed, guildId, channelId);
-    if (channelEntry && channelEntry.baseline) return channelEntry.baseline;
+    if (channelEntry && channelEntry.baseline) embedded = channelEntry.baseline;
   } catch {
-    // ignore and fallback
+    // ignore and continue to legacy fallback
   }
 
-  // fallback to legacy baselines.json
+  // Read legacy baselines.json if present
+  let legacy: any | undefined;
   try {
-    if (!fs.existsSync(BASELINES_PATH)) return undefined;
-    const raw = fs.readFileSync(BASELINES_PATH, { encoding: 'utf8' });
-    const parsed = JSON.parse(raw);
-    const k = baselineKey(guildId, channelId);
-    if (parsed && typeof parsed === 'object' && parsed[k]) return parsed[k];
-  } catch {
-    // ignore
+    if (fs.existsSync(BASELINES_PATH)) {
+      const raw = fs.readFileSync(BASELINES_PATH, { encoding: 'utf8' });
+      const parsed = JSON.parse(raw);
+      const k = baselineKey(guildId, channelId);
+      if (parsed && typeof parsed === 'object' && parsed[k]) legacy = parsed[k];
+    }
+  } catch (err: unknown) {
+    const msg = err instanceof Error ? err.message : String(err);
+    logger.debug(`Failed to read legacy baselines.json - ${msg}`);
   }
-  return undefined;
+
+  // If both exist, choose the most recent by timestamp when available to avoid re-processing old messages.
+  if (embedded && legacy) {
+    try {
+      const eTs = typeof embedded.timestamp === 'string' ? Date.parse(embedded.timestamp) : NaN;
+      const lTs = typeof legacy.timestamp === 'string' ? Date.parse(legacy.timestamp) : NaN;
+      if (!isNaN(eTs) && !isNaN(lTs)) {
+        return lTs >= eTs ? legacy : embedded;
+      }
+      if (!isNaN(lTs) && isNaN(eTs)) return legacy;
+      if (!isNaN(eTs) && isNaN(lTs)) return embedded;
+    } catch {
+      // fallthrough to prefer legacy as a safe default
+    }
+    // Prefer legacy baseline when timestamps are not comparable — runtime persists there by default.
+    return legacy;
+  }
+
+  // If only one exists, return it; otherwise undefined.
+  return embedded ?? legacy ?? undefined;
 }
 
 /**
